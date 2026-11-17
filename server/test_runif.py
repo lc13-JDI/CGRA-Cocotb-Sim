@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import cocotb, logging, threading, struct, numpy, heapq, json, copy
 import dataclasses
+import cocotb.queue
+
+PRIVATE_STREAM_OWNERSHIP_VERSION = 1
 from operator import attrgetter
 
 
@@ -16,6 +19,7 @@ class StreamFunction(Enum):
     EVENT_SET = auto()
     RELEASE = auto()
     APPLY = auto()
+    SYNCHRONIZE = auto()
 
 
 @dataclass
@@ -302,14 +306,22 @@ class DeviceEvent:
     def __init__(self):
         # self._event = asyncio.Event()
         self._event = cocotb.triggers.Event()
+        self._error = None
 
     def set(self):
         """Record the event on a stream"""
         self._event.set()
 
+    def fail(self, error):
+        """Wake waiters with the original asynchronous work error."""
+        self._error = error
+        self._event.set()
+
     async def wait(self):
-        """Wait for the event to complete"""
+        """Wait for successful completion or propagate the work error."""
         await self._event.wait()
+        if self._error is not None:
+            raise self._error
 
     def is_set(self) -> bool:
         """Check if event has occurred"""
@@ -317,6 +329,7 @@ class DeviceEvent:
 
     def clear(self):
         """Clear the event state"""
+        self._error = None
         self._event.clear()
 
 
@@ -437,6 +450,13 @@ class DeviceStreamReorderQueue:
         self._in_processing_event.set()
 
 
+class _StreamCompletion(DeviceEvent):
+    """Stable evidence for work accepted through a particular sequence."""
+    def __init__(self, target):
+        super().__init__()
+        self.target = target
+
+
 class DeviceStream:
     # 当不输入I/O depend_type(默认为0)时，即强制按任务提交顺序完成
     # execution_finish已删除，会自动在EXE与D2H/下个EXE之间插入
@@ -452,6 +472,13 @@ class DeviceStream:
         self.runtime = runtime
         self.id = stream_id
         self.priority = priority
+        self._accepted = 0
+        self._completed = 0
+        self._error = None
+        self._fences = []
+        self._retired = False
+        self._retiring = False
+        self._retirement_lock = cocotb.triggers.Lock()
         # self._queue = asyncio.Queue(maxsize=task_queue_size)
         # self._queue = cocotb.queue.Queue(maxsize=task_queue_size)
         self._queue = cocotb.queue.Queue()
@@ -470,12 +497,12 @@ class DeviceStream:
     async def apply(self, configs: List[DeviceConfig]):
         """Apply enough resource for bunch of configs, each time only one config can be running"""
         configs_new = copy.deepcopy(configs)
-        await self._queue.put((StreamFunction.APPLY, configs_new))
+        self._enqueue((StreamFunction.APPLY, configs_new))
         self._start_processing()
 
     async def config(self, config_id: int = 0):
         """Switch a configuration on device, ignore if it is the same as the previous time"""
-        await self._queue.put((StreamFunction.CONFIG, config_id))
+        self._enqueue((StreamFunction.CONFIG, config_id))
         self._start_processing()
 
     async def memcpyHostToDevice(
@@ -514,7 +541,7 @@ class DeviceStream:
 
         if depend_type not in [0, 1, 2]:
             depend_type = 0
-        await self._queue.put(
+        self._enqueue(
             (
                 StreamFunction.MEMCPY_HOSTTODEVICE,
                 (d_data, h_data, size, dtype, depend_type),
@@ -557,7 +584,7 @@ class DeviceStream:
 
         if depend_type not in [0, 1]:
             depend_type = 0
-        await self._queue.put(
+        self._enqueue(
             (
                 StreamFunction.MEMCPY_DEVICETOHOST,
                 (d_data, h_data, size, dtype, depend_type),
@@ -568,65 +595,97 @@ class DeviceStream:
 
     async def execution_start(self):
         """Add an execution start task to the stream"""
-        await self._queue.put((StreamFunction.EXECUTION_START, None))
+        self._enqueue((StreamFunction.EXECUTION_START, None))
         self._start_processing()
 
     async def memcpyFence(self):
         """Wait for execution to finish"""
-        await self._queue.put((StreamFunction.MEMCPY_FENCE, None))
+        self._enqueue((StreamFunction.MEMCPY_FENCE, None))
         self._start_processing()
 
     async def release(self):
         """Release apply the applied resources, invalidate the handler"""
-        await self._queue.put((StreamFunction.RELEASE, None))
+        self._enqueue((StreamFunction.RELEASE, None))
         self._start_processing()
 
     async def wait_event(self, event: DeviceEvent):
         """Wait for an event before proceeding"""
-        await self._queue.put((StreamFunction.EVENT_WAIT, event))
+        self._enqueue((StreamFunction.EVENT_WAIT, event))
         self._start_processing()
 
     async def set_event(self, event: DeviceEvent):
         """Set an event at this point in the stream"""
-        await self._queue.put((StreamFunction.EVENT_SET, event))
+        self._enqueue((StreamFunction.EVENT_SET, event))
         self._start_processing()
+
+    def _enqueue(self, task):
+        # This queue is unbounded. Acceptance and sequence assignment cannot
+        # suspend, so global snapshots precisely delimit earlier submissions.
+        if self._retired or self._retiring:
+            raise RuntimeError("cannot submit to a retiring or retired stream")
+        if self._error is not None:
+            raise self._error
+        self._accepted += 1
+        self._queue.put_nowait((*task, self._accepted))
 
     def _start_processing(self):
-        """Start processing the queue if not already running"""
-        if not self._running and self._current_task is None:
-            # self._current_task = self.runtime.loop.create_task(self._process_queue())
+        """Start a worker only when actual accepted work is queued."""
+        if (not self._queue.empty() and not self._retired
+                and self._error is None and self._current_task is None):
+            self._completion_event.clear()
             self._current_task = cocotb.start_soon(self._process_queue())
-            self._completion_event.clear()  # 重置完成事件
+
+    def _snapshot_completion(self):
+        """Capture accepted work synchronously, before a caller's first await."""
+        fence = _StreamCompletion(self._accepted)
+        if self._error is not None:
+            fence.fail(self._error)
+        elif self._completed >= fence.target:
+            fence.set()
+        else:
+            self._fences.append(fence)
+            self._queue.put_nowait((StreamFunction.SYNCHRONIZE, fence, fence.target))
+            self._start_processing()
+        return fence
+
+    def _mark_completed(self, sequence):
+        self._completed = max(self._completed, sequence)
+        pending = []
+        for fence in self._fences:
+            if fence.target <= self._completed:
+                fence.set()
+            else:
+                pending.append(fence)
+        self._fences = pending
+
+    async def _flush_work(self):
+        await self._reorder_queue.clear()
+        if self._handler.running:
+            await self.runtime.finish_execution(self._handler)
 
     async def synchronize(self):
-        """Wait for all tasks in the stream to complete"""
-        # await self._queue.join()
-
-        if self._current_task is not None:
-            await self._completion_event.wait()
-        # print("task len", self._queue.qsize())
-        # 可能有新任务加入队列
-        self._start_processing()
-        if self._current_task is not None:
-            await self._completion_event.wait()
+        """Wait for work accepted at entry, preserving original worker errors."""
+        await self._snapshot_completion().wait()
 
     async def _process_queue(self):
         """Process tasks in the queue"""
         self._running = True
         try:
-            while not self._queue.empty():
-                try:
-                    # 添加超时防止永久阻塞
-                    task_type, task_data = await cocotb.triggers.with_timeout(
-                        self._queue.get(), timeout_time=10, timeout_unit="ns"
-                    )
-                except TimeoutError:
-                    # 队列空且超时则退出
-                    break
+            processed = self._completed
+            while True:
+                if self._queue.empty():
+                    await self._flush_work()
+                    self._mark_completed(processed)
+                    if self._queue.empty():
+                        break
+                task_type, task_data, sequence = self._queue.get_nowait()
 
-                if task_type == StreamFunction.APPLY:
+                if task_type == StreamFunction.SYNCHRONIZE:
+                    await self._flush_work()
+                    self._mark_completed(sequence)
+                elif task_type == StreamFunction.APPLY:
                     # avoid resources leaks
-                    await self._reorder_queue.clear()
+                    await self._flush_work()
                     if self._handler.valid:
                         await self.runtime.release_config(self._handler)
 
@@ -634,7 +693,7 @@ class DeviceStream:
 
                 elif task_type == StreamFunction.RELEASE:
                     # release applied resource
-                    await self._reorder_queue.clear()
+                    await self._flush_work()
                     await self.runtime.release_config(self._handler)
                 elif task_type == StreamFunction.EVENT_WAIT:
                     await self._reorder_queue.clear()
@@ -666,11 +725,19 @@ class DeviceStream:
                     await self._reorder_queue.add_task(task_type, task_data)
                     # await self.runtime.start_execution(self._handler)
 
-                # self._queue.task_done()
+                processed = sequence
+        except BaseException as error:
+            # No successful completion or speculative cleanup after work fails.
+            # Keep the stream and its queue rooted in the runtime for its owner.
+            self._error = error
+            for fence in self._fences:
+                fence.fail(error)
+            self._fences.clear()
+            self._completion_event.fail(error)
+        else:
+            self._completion_event.set()
         finally:
-            await self._reorder_queue.clear()
             self._running = False
-            self._completion_event.set()  # 标记处理完成
             self._current_task = None
 
 
@@ -891,7 +958,13 @@ class StreamScheduler:
 
             flag = False
             for id, state in self._device_state.items():
-                if state.func(*task_param):
+                try:
+                    fitted = state.func(*task_param)
+                except Exception as error:
+                    task_event.fail(error)
+                    flag = True
+                    break
+                if fitted:
                     task_event.set()
                     flag = True
                     break
@@ -932,14 +1005,25 @@ class AsyncTaskQueue:
         self._running = False
         self._current_task = None
         self._completion_event = DeviceEvent()
+        self._error = None
 
     def size(self) -> int:
         return self._queue.qsize()
 
     async def add_task(self, param: Tuple[Any]) -> DeviceEvent:
         """Add task to queue and return a event"""
+        if self._error is not None:
+            raise self._error
         event = DeviceEvent()
         await self._queue.put((param, event))
+        # A bounded put may have suspended before the worker failed. Admission
+        # must recheck poison without another await. Draining also wakes the
+        # next blocked producer, which follows this same rejection path.
+        if self._error is not None:
+            while not self._queue.empty():
+                _, pending = self._queue.get_nowait()
+                pending.fail(self._error)
+            raise self._error
         self._start_processing()
         return event
 
@@ -947,25 +1031,39 @@ class AsyncTaskQueue:
         """Wait for all tasks in the queue to complete"""
         if self._current_task is not None:
             await self._completion_event.wait()
+        if self._error is not None:
+            raise self._error
 
     def _start_processing(self):
         """Start processing the queue if not already running"""
-        if not self._running and self._current_task is None:
+        if (self._error is None and not self._queue.empty()
+                and not self._running and self._current_task is None):
             self._current_task = cocotb.start_soon(self._process_queue())
             self._completion_event.clear()
 
     async def _process_queue(self):
         """Process tasks in the queue"""
         self._running = True
+        event = None
         try:
             while not self._queue.empty():
                 param, event = await self._queue.get()
                 await self._func(*param)
                 event.set()
+                event = None
+        except BaseException as error:
+            self._error = error
+            if event is not None:
+                event.fail(error)
+            while not self._queue.empty():
+                _, pending = self._queue.get_nowait()
+                pending.fail(error)
+            self._completion_event.fail(error)
+        else:
+            self._completion_event.set()
         finally:
             self._running = False
             self._current_task = None
-            self._completion_event.set()
 
 
 @dataclass
@@ -976,6 +1074,7 @@ class DeviceExeRegInfo:
 
 
 class DeviceRuntime:
+    PRIVATE_STREAM_OWNERSHIP_VERSION = PRIVATE_STREAM_OWNERSHIP_VERSION
 
     def __init__(
         self,
@@ -1002,7 +1101,7 @@ class DeviceRuntime:
 
         self._device_managers: List[DeviceManager] = []
         self._device_exereg: List[DeviceExeRegInfo] = []
-        self._device_fetch_exereg_interval: float = 1000.0
+        self._device_fetch_exereg_interval: float = 10.0
         cocotb.start_soon(self._read_device_status())
 
         # 优先级越大越重要
@@ -1019,13 +1118,45 @@ class DeviceRuntime:
     def is_device_busy(self) -> bool:
         return self._streams.__len__() > 0
 
+    def _validate_stream(self, stream):
+        if not isinstance(stream, DeviceStream) or stream.runtime is not self:
+            raise ValueError("stream does not belong to this runtime")
+        if not stream._retired and self._streams.get(stream.id) is not stream:
+            raise ValueError("stream identity does not match the registered object")
+
+    async def retire_completed_stream(self, stream: DeviceStream):
+        """Owner-only, exact-object retirement after confirmed successful work.
+
+        Idempotence lives on the object, not in a history registry. A failed
+        cleanup leaves the registered stream discoverable for safe retry.
+        """
+        self._validate_stream(stream)
+        async with stream._retirement_lock:
+            self._validate_stream(stream)
+            if stream._retired:
+                return
+            if stream._error is not None:
+                raise stream._error
+            if stream._completed != stream._accepted or stream._handler.running:
+                raise RuntimeError("stream completion is not confirmed")
+            stream._retiring = True
+            try:
+                if stream._handler.valid:
+                    await self.release_config(stream._handler)
+                # Never remove another object, even if a caller reuses an ID.
+                if self._streams.get(stream.id) is not stream:
+                    raise ValueError("stream registration changed during retirement")
+                del self._streams[stream.id]
+                stream._retired = True
+            finally:
+                stream._retiring = False
+
     async def destory_stream(self, stream: DeviceStream):
-        stream_id = stream.id
-        if stream_id in self._streams:
-            await self._streams[stream_id].synchronize()
-            await self.release_config(self._streams[stream_id]._handler)
-            del self._streams[stream_id]
-        del stream
+        """Compatibility owner close; wait successfully, then retire exactly it."""
+        self._validate_stream(stream)
+        if not stream._retired:
+            await stream.synchronize()
+        await self.retire_completed_stream(stream)
 
     def create_stream(
         self,
@@ -1411,19 +1542,23 @@ class DeviceRuntime:
         reg = self._device_exereg[handler.device_id]
         reg.need_count += 1
 
-        count = 10000
-        while count > 0:
-            if reg.resp_time > cur_time:
-                cur_time = cocotb.utils.get_sim_time(units="ns")
-                if byte_include(reg.exe_reg, en_tile):
-                    break
-                count -= 1
-                if count == 0:
-                    self.log.debug(f"EXE time out")
-                    break
-            await cocotb.triggers.Timer(self._device_fetch_exereg_interval, units="ns")
-
-        reg.need_count -= 1
+        deadline = cur_time + 10000 * self._device_fetch_exereg_interval
+        try:
+            while True:
+                now = cocotb.utils.get_sim_time(units="ns")
+                if reg.resp_time > cur_time:
+                    cur_time = now
+                    if byte_include(reg.exe_reg, en_tile):
+                        break
+                if now >= deadline:
+                    raise TimeoutError(
+                        f"stream {handler.stream_id} execution completion timed out"
+                    )
+                await cocotb.triggers.Timer(
+                    self._device_fetch_exereg_interval, units="ns"
+                )
+        finally:
+            reg.need_count -= 1
 
         handler.exef_time = cocotb.utils.get_sim_time(units="ns")
         self.log.debug(
@@ -1440,28 +1575,33 @@ class DeviceRuntime:
         if not handler.valid:
             return
 
-        # 在device manager中释放已占用资源
-        self._device_managers[handler.device_id].release_config(handler)
+        # Invalidate the lease immediately after its actual return. Notification
+        # or logging failure must not make a retry return the same lease twice.
+        device_id = handler.device_id
+        manager = self._device_managers[device_id]
+        manager.release_config(handler)
+        handler.clear()
 
         # 通知scheduler有任务释放
-        self._stream_scheduler.device_state_update(handler.device_id)
+        self._stream_scheduler.device_state_update(device_id)
 
         self.log.debug(
-            f"RELEASE task, stream {handler.stream_id}, device {handler.device_id}"
+            f"RELEASE task, stream {handler.stream_id}, device {device_id}"
         )
         self.log.debug(
-            f"device {handler.device_id}: tile free list {self._device_managers[handler.device_id].tile_free_list}"
+            f"device {device_id}: tile free list {manager.tile_free_list}"
         )
         self.log.debug(
-            f"device {handler.device_id}:  cfg free list {self._device_managers[handler.device_id].cfg_free_list}"
+            f"device {device_id}:  cfg free list {manager.cfg_free_list}"
         )
-        handler.clear()
         return
 
     async def synchronize_all(self):
-        """Wait for all streams to complete"""
-        for stream in self._streams.values():
-            await stream.synchronize()
+        """Wait for members and their accepted work at entry, before any await."""
+        fences = tuple(stream._snapshot_completion()
+                       for stream in tuple(self._streams.values()))
+        for fence in fences:
+            await fence.wait()
 
 
 ## @jhlou
